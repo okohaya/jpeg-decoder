@@ -144,6 +144,11 @@ int get_2byte(context* ctx)
     return (a << 8) + b;
 }
 
+void read_bytes_into(context* ctx, int len, uint8_t* buf)
+{
+    fread(buf, len, 1, ctx->fp);
+}
+
 int nextbit(context* ctx)
 {
     if (ctx->_cnt == 0) {
@@ -177,6 +182,41 @@ int get_marker(context* ctx)
     while (marker == 0xff)          // optional fill bytes
         marker = get_1byte(ctx);
     return marker;
+}
+
+void parse_JFIF(context* ctx, int /* len */)
+{
+    int version = get_2byte(ctx);       // version  (e.g. 0x0102 => 1.02)
+    int units = get_1byte(ctx);         // units for H/V densities (0:unspecified, 1:dot/inch, 2:dot/cm)
+    int h_density = get_2byte(ctx);     // horizontal pixel density
+    int v_density = get_2byte(ctx);     // vertical pixel density
+    int h_thumbnail = get_1byte(ctx);   // thumbnail width (may be 0)
+    int v_thumbnail = get_1byte(ctx);   // thumbnail height (may be 0)
+    skip_byte(ctx, h_thumbnail * v_thumbnail * 3);  // thumbnail 24bit RGB values (optional)
+
+    printf("JFIF ver:%04x\n", version);
+    printf("  density unit:%d (0:x,1:dpi,2:dpcm), H:%d, V:%d\n", units, h_density, v_density);
+    printf("  thumbnail width:%d, height:%d\n", h_thumbnail, v_thumbnail);
+}
+
+void parse_JFXX(context* ctx, int len)
+{
+    printf("JFIF extension\n");
+    skip_byte(ctx, len);                // thumbnail
+}
+
+void parse_APP0(context* ctx)
+{
+    printf("[APP0]\n");
+    int len = get_2byte(ctx) - 2;
+    uint8_t buf[5];
+    read_bytes_into(ctx, 5, buf);
+
+    if (memcmp(buf, "JFIF\x00", 5) == 0) { parse_JFIF(ctx, len - 5); return; }
+    if (memcmp(buf, "JFXX\x00", 5) == 0) { parse_JFXX(ctx, len - 5); return; }
+
+    ERROR("not JFIF");
+    exit(1);
 }
 
 // Quantization table
@@ -462,6 +502,9 @@ uint8_t* decode_jpeg(context* ctx)
     while (1) {
         int marker = get_marker(ctx);
         switch (marker) {
+            case 0xe0:
+                parse_APP0(ctx);
+                break;
             case 0xdb:
                 parse_DQT(ctx);
                 break;
