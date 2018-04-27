@@ -247,7 +247,7 @@ void parse_SOF0(context* ctx)
     ctx->comp_n = get_1byte(ctx);               // number of image components: 1-255
 
     printf("  width:%d, height:%d, comp_n:%d\n", ctx->x, ctx->y, ctx->comp_n);
-    if (ctx->x % 8 != 0 || ctx->y % 8 != 0 || ctx->comp_n != 3) {
+    if (ctx->comp_n != 3) {
         ERROR("format not supported");
         exit(1);
     }
@@ -422,29 +422,32 @@ void decode_block(context* ctx, int mcu_idx) {
     }
 }
 
-void YCbCr_to_RGB(uint8_t* pY, uint8_t* pCb, uint8_t* pCr, uint8_t* rgb)
+void YCbCr_to_RGB(uint8_t* in, uint8_t* out)
 {
-    uint8_t Y = *pY, Cb = *pCb, Cr = *pCr;
-    rgb[0] = clamp(round(Y                       + 1.402  * (Cr - 128)));   // R
-    rgb[1] = clamp(round(Y - 0.3441 * (Cb - 128) - 0.7141 * (Cr - 128)));   // G
-    rgb[2] = clamp(round(Y + 1.772  * (Cb - 128)                      ));   // B
+    uint8_t Y  = in[0];
+    uint8_t Cb = in[1];
+    uint8_t Cr = in[2];
+    out[0] = clamp(round(Y                       + 1.402  * (Cr - 128)));   // R
+    out[1] = clamp(round(Y - 0.3441 * (Cb - 128) - 0.7141 * (Cr - 128)));   // G
+    out[2] = clamp(round(Y + 1.772  * (Cb - 128)                      ));   // B
 }
 
-void output_to_pixel(context* ctx, uint8_t* p, int mcu_idx)
+void output_to_pixel(context* ctx, uint8_t* out)
 {
-    int w = ctx->h_mcus * ctx->mcu_x * ctx->comp_n;
-    int xos = (mcu_idx % ctx->h_mcus) * ctx->mcu_x;
-    int yos = (mcu_idx / ctx->h_mcus) * ctx->mcu_y;
+    uint8_t in[3];
 
-    int offset  = ctx->mcu_x * ctx->mcu_y * mcu_idx;
-    uint8_t* pY  = ctx->comp[0].data + offset;
-    uint8_t* pCb = ctx->comp[1].data + offset;
-    uint8_t* pCr = ctx->comp[2].data + offset;
+    for (int y = 0; y < ctx->y; y++) {
+        for (int x = 0; x < ctx->x; x++) {
+            int mcu_idx = (y / ctx->mcu_y * ctx->h_mcus) + (x / ctx->mcu_x);
+            int offset = ((y % ctx->mcu_y) * ctx->mcu_x) + (x % ctx->mcu_x);
+            int pos = (ctx->mcu_x * ctx->mcu_y) * mcu_idx + offset;
 
-    for (int y = 0; y < ctx->mcu_y; y++) {
-        for (int x = 0; x < ctx->mcu_x; x++) {
-            uint8_t* out = &p[w*(y+yos) + ctx->comp_n*(x+xos)];
-            YCbCr_to_RGB(pY++, pCb++, pCr++, out);
+            in[0] = ctx->comp[0].data[pos];
+            in[1] = ctx->comp[1].data[pos];
+            in[2] = ctx->comp[2].data[pos];
+
+            YCbCr_to_RGB(in, out);
+            out += 3;
         }
     }
 }
@@ -482,12 +485,9 @@ uint8_t* parse_SOS(context* ctx) {
         exit(1);
     }
 
-    int size = (ctx->mcu_x * ctx->h_mcus) * (ctx->mcu_y * ctx->v_mcus) * ctx->comp_n;
+    int size = ctx->x * ctx->y * 3;     // RGB
     uint8_t* pixel = new uint8_t[size];
-
-    for (int i = 0; i < ctx->v_mcus * ctx->h_mcus; i++) {
-        output_to_pixel(ctx, pixel, i);
-    }
+    output_to_pixel(ctx, pixel);
 
     return pixel;
 }
