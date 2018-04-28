@@ -8,18 +8,30 @@
 uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel);
 
 
-XImage* create_image(Display* display, Visual* visual, uint8_t* image, int width, int height) {
+XImage* create_image(Display* display, Visual* visual, uint8_t* image, int width, int height, int n) {
     uint8_t* p = (uint8_t*)malloc(width * height * 4);    // [B,G,R,_]
     uint8_t* src = image;
     uint8_t* dst = p;
 
-    for (int i = 0; i < width * height; i++) {
-        dst[3] = 0;
-        dst[2] = src[0];
-        dst[1] = src[1];
-        dst[0] = src[2];
-        dst += 4;
-        src += 3;
+    if (n == 1) {
+        for (int i = 0; i < width * height; i++) {
+            dst[3] = 0;
+            dst[2] = src[0];
+            dst[1] = src[0];
+            dst[0] = src[0];
+            dst += 4;
+            src += 1;
+        }
+    }
+    if (n == 3) {
+        for (int i = 0; i < width * height; i++) {
+            dst[3] = 0;
+            dst[2] = src[0];
+            dst[1] = src[1];
+            dst[0] = src[2];
+            dst += 4;
+            src += 3;
+        }
     }
 
     return XCreateImage(display, visual, 24, ZPixmap, 0, (char*)p, width, height, 32, 0);
@@ -35,6 +47,10 @@ int main(int argc, char** argv)
     const char* filename = argv[1];
     int width, height, n;
     uint8_t* data = load_jpeg(filename, &width, &height, &n);
+    if (n != 1 && n != 3) {
+        printf("invalid number of components : %d\n", n);
+        return 1;
+    }
 
     Display* display = XOpenDisplay(NULL);
     if (display == NULL) {
@@ -51,7 +67,7 @@ int main(int argc, char** argv)
     XMapWindow(display, window);
 
     Visual* visual = DefaultVisual(display, 0);
-    XImage* ximage = create_image(display, visual, data, width, height);
+    XImage* ximage = create_image(display, visual, data, width, height, n);
     GC gc = DefaultGC(display, screen);
     XEvent event;
     KeyCode escape = XKeysymToKeycode(display, XK_Escape);

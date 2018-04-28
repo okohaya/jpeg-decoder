@@ -82,16 +82,15 @@ struct context {
     int mcu_y;              // MCU height: 8
     int h_mcus;             // number of MCUs in horizontal direction
     int v_mcus;             // number of MCUs in vertical direction
-    int comp_n;             // number of components: 3
+    int comp_n;             // number of components: 1 or 3
     struct {
-        int id;             // component id
         int h;              // horizontal sampling factor
         int v;              // vertical sampling factor
         int tq;             // quantization table id: 0-3
         int td;             // DC huffman table id: 0-1
         int ta;             // AC huffman table id: 0-1
         uint8_t* data;
-    } comp[3];              // components
+    } comp[3];              // components 0:Y, 1:Cb, 2:Cr
 };
 
 uint8_t* decode_jpeg(context* ctx);
@@ -244,18 +243,18 @@ void parse_SOF0(context* ctx)
     get_1byte(ctx);                             // precision: 8
     ctx->y = get_2byte(ctx);                    // number of lines
     ctx->x = get_2byte(ctx);                    // number of samples per line
-    ctx->comp_n = get_1byte(ctx);               // number of image components: 1-255
+    ctx->comp_n = get_1byte(ctx);               // number of image components: 1-255 (JFIF : 1 or 3)
 
     printf("  width:%d, height:%d, comp_n:%d\n", ctx->x, ctx->y, ctx->comp_n);
-    if (ctx->comp_n != 3) {
-        ERROR("format not supported");
+    if (ctx->comp_n != 1 && ctx->comp_n != 3) {
+        ERROR("comp_n %d not supported", ctx->comp_n);
         exit(1);
     }
 
     int hmax = 1;
     int vmax = 1;
     for (int i = 0; i < ctx->comp_n; i++) {
-        ctx->comp[i].id = get_1byte(ctx);       // component id: 0-255
+        get_1byte(ctx);                         // component id: 0-255 (JFIF : Y=1,Cb=2,Cr=3)
         int hv = get_1byte(ctx);
         ctx->comp[i].h  = hv >> 4;              // horizontal sampling factor: 1-4
         ctx->comp[i].v  = hv & 0xf;             // vertical sampling factor: 1-4
@@ -266,7 +265,7 @@ void parse_SOF0(context* ctx)
             ERROR("subsampling not supported (hv:%02x)", hv);
             exit(1);
         }
-        printf("  component:%d, hv:%02x, q_table:%d\n", ctx->comp[i].id, hv, ctx->comp[i].tq);
+        printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, ctx->comp[i].tq);
     }
 
     ctx->mcu_x = 8 * hmax;
@@ -442,12 +441,17 @@ void output_to_pixel(context* ctx, uint8_t* out)
             int offset = ((y % ctx->mcu_y) * ctx->mcu_x) + (x % ctx->mcu_x);
             int pos = (ctx->mcu_x * ctx->mcu_y) * mcu_idx + offset;
 
-            in[0] = ctx->comp[0].data[pos];
-            in[1] = ctx->comp[1].data[pos];
-            in[2] = ctx->comp[2].data[pos];
+            if (ctx->comp_n == 1) {
+                *out = ctx->comp[0].data[pos];
+                out += 1;
+            } else {    // comp_n == 3
+                in[0] = ctx->comp[0].data[pos];
+                in[1] = ctx->comp[1].data[pos];
+                in[2] = ctx->comp[2].data[pos];
 
-            YCbCr_to_RGB(in, out);
-            out += 3;
+                YCbCr_to_RGB(in, out);
+                out += 3;
+            }
         }
     }
 }
@@ -457,12 +461,13 @@ uint8_t* parse_SOS(context* ctx) {
     printf("[SOS]\n");
     get_2byte(ctx);                         // header length
     uint8_t Ns = get_1byte(ctx);            // number of image components in scan: 1-4
+    assert(Ns == 1 || Ns == 3);
     for (int i = 0; i < Ns; i++) {
-        uint8_t Cs = get_1byte(ctx);        // component id: 0-255
+        get_1byte(ctx);                     // component id
         uint8_t T = get_1byte(ctx);
-        ctx->comp[Cs - 1].td = T >> 4;      // DC huffman table id: 0-1
-        ctx->comp[Cs - 1].ta = T & 0xf;     // AC huffman table id: 0-1
-        printf("  component:%d, huff_table DC:%d, AC:%d\n", Cs, T >> 4, T & 0xf);
+        ctx->comp[i].td = T >> 4;           // DC huffman table id: 0-1
+        ctx->comp[i].ta = T & 0xf;          // AC huffman table id: 0-1
+        printf("  component i:%d, huff_table DC:%d, AC:%d\n", i, T >> 4, T & 0xf);
     }
                                             // (for progressive/lossless?)
     get_1byte(ctx);                         // start of spectral
@@ -485,7 +490,7 @@ uint8_t* parse_SOS(context* ctx) {
         exit(1);
     }
 
-    int size = ctx->x * ctx->y * 3;     // RGB
+    int size = ctx->x * ctx->y * ctx->comp_n;
     uint8_t* pixel = new uint8_t[size];
     output_to_pixel(ctx, pixel);
 
