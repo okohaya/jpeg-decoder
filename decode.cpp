@@ -78,8 +78,8 @@ struct context {
 
     int x;                  // image width
     int y;                  // image height
-    int mcu_x;              // MCU width: 8
-    int mcu_y;              // MCU height: 8
+    int mcu_x;              // MCU width
+    int mcu_y;              // MCU height
     int h_mcus;             // number of MCUs in horizontal direction
     int v_mcus;             // number of MCUs in vertical direction
     int comp_n;             // number of components: 1 or 3
@@ -261,10 +261,6 @@ void parse_SOF0(context* ctx)
         ctx->comp[i].tq = get_1byte(ctx);       // quantization table id: 0-3
         hmax = max(hmax, ctx->comp[i].h);
         vmax = max(vmax, ctx->comp[i].v);
-        if (hv != 0x11) {
-            ERROR("subsampling not supported (hv:%02x)", hv);
-            exit(1);
-        }
         printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, ctx->comp[i].tq);
     }
 
@@ -404,20 +400,54 @@ void inverseDCT(int* blk)
     }
 }
 
-void decode_block(context* ctx, int mcu_idx) {
+void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, uint8_t* out) {
+    int H = ctx->comp[comp_i].h;
+    out += (blk_i % H) * 8;         // x offset
+    out += (blk_i / H) * (64 * H);  // y offset
+
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0 ; x < 8; x++) {
+            out[y * ctx->mcu_x + x] = data[y * 8 + x];
+        }
+    }
+}
+
+// nearest-neighbor
+void upsample(context *ctx, int comp_i, uint8_t* out) {
+    int H = ctx->mcu_x / 8 / ctx->comp[comp_i].h;
+    int V = ctx->mcu_y / 8 / ctx->comp[comp_i].v;
+    if (H == 1 && V == 1)
+        return;
+
+    for (int y = ctx->mcu_y - 1; y >= 0; y--) {
+        for (int x = ctx->mcu_x - 1; x >= 0; x--) {
+            out[(y * ctx->mcu_x) + x] = out[(y / V * ctx->mcu_x) + x / H];
+        }
+    }
+}
+
+void decode_mcu(context* ctx, int mcu_idx) {
+    int mcu_size = ctx->mcu_x * ctx->mcu_y;
     int data[64];
-    int offset = 64 * mcu_idx;
+    uint8_t* out;
 
-    for (int i = 0; i < ctx->comp_n; i++) {
-        memset(data, 0, sizeof(data));
+    for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
 
-        load_huffman_DC(ctx, data, i);
-        load_huffman_AC(ctx, data, i);
-        dequantization(data, ctx->q_table[ctx->comp[i].tq]);
-        inverseDCT(data);
+        out = ctx->comp[comp_i].data + mcu_size * mcu_idx;
+        int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
 
-        uint8_t* p = ctx->comp[i].data + offset;
-        copy(data, data+64, p);
+        for (int blk_i = 0; blk_i < block_n; blk_i++) {
+            memset(data, 0, sizeof(data));
+
+            load_huffman_DC(ctx, data, comp_i);
+            load_huffman_AC(ctx, data, comp_i);
+            dequantization(data, ctx->q_table[ctx->comp[comp_i].tq]);
+            inverseDCT(data);
+
+            copy_to_mcu(ctx, comp_i, blk_i, data, out);
+        }
+
+        upsample(ctx, comp_i, out);
     }
 }
 
@@ -480,7 +510,7 @@ uint8_t* parse_SOS(context* ctx) {
     }
 
     for (int i = 0; i < ctx->h_mcus * ctx->v_mcus; i++) {
-        decode_block(ctx, i);
+        decode_mcu(ctx, i);
     }
 
     clearbit(ctx);
