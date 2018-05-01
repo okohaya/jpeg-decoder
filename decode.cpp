@@ -8,7 +8,7 @@
 #include <algorithm>
 using namespace std;
 
-#define ERROR(fmt, ...) fprintf(stderr, "%s:%d %s(), error: " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#define ERROR(fmt, ...) do { fprintf(stderr, "%s:%d %s(), error: " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); exit(1); } while (0)
 
 
 const int ZZ[64] = {      // zigzag order index
@@ -89,37 +89,9 @@ struct context {
         int tq;             // quantization table id: 0-3
         int td;             // DC huffman table id: 0-1
         int ta;             // AC huffman table id: 0-1
-        uint8_t* data;
+        int16_t* coeff;     // DCT coefficients
     } comp[3];              // components 0:Y, 1:Cb, 2:Cr
 };
-
-uint8_t* decode_jpeg(context* ctx);
-
-uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel)
-{
-    initialize_table();
-    FILE* fp = fopen(filename, "rb");
-    if (!fp) {
-        ERROR("%s", strerror(errno));
-        exit(1);
-    }
-    context ctx = {};
-    ctx.fp = fp;
-
-    uint8_t* data = decode_jpeg(&ctx);
-    *width = ctx.x;
-    *height = ctx.y;
-    *channel = ctx.comp_n;
-
-    fclose(fp);
-    for (int i = 0; i < 2; i++) {
-        destroy_huffman_tree(ctx.huffman_DC[i]);
-        destroy_huffman_tree(ctx.huffman_AC[i]);
-    }
-    for (int i = 0; i < ctx.comp_n; i++)
-        delete[] ctx.comp[i].data;
-    return data;
-}
 
 int get_pos(context* ctx)
 {
@@ -157,7 +129,6 @@ int nextbit(context* ctx)
             int x = get_1byte(ctx);
             if (x != 0) {           // not stuffing byte
                 ERROR("found marker 0x%02x in compressed image data", x);
-                exit(1);
             }
         }
     }
@@ -176,7 +147,6 @@ int get_marker(context* ctx)
     int marker = get_1byte(ctx);
     if (marker != 0xff) {
         ERROR("expected marker 0xff, but got 0x%02x", marker);
-        exit(1);
     }
     while (marker == 0xff)          // optional fill bytes
         marker = get_1byte(ctx);
@@ -215,7 +185,6 @@ void parse_APP0(context* ctx)
     if (memcmp(buf, "JFXX\x00", 5) == 0) { parse_JFXX(ctx, len - 5); return; }
 
     ERROR("not JFIF");
-    exit(1);
 }
 
 // Quantization table
@@ -248,26 +217,29 @@ void parse_SOF0(context* ctx)
     printf("  width:%d, height:%d, comp_n:%d\n", ctx->x, ctx->y, ctx->comp_n);
     if (ctx->comp_n != 1 && ctx->comp_n != 3) {
         ERROR("comp_n %d not supported", ctx->comp_n);
-        exit(1);
     }
 
     int hmax = 1;
     int vmax = 1;
     for (int i = 0; i < ctx->comp_n; i++) {
-        get_1byte(ctx);                         // component id: 0-255 (JFIF : Y=1,Cb=2,Cr=3)
+        get_1byte(ctx);                                 // component id: 0-255 (JFIF : Y=1,Cb=2,Cr=3)
         int hv = get_1byte(ctx);
-        ctx->comp[i].h  = hv >> 4;              // horizontal sampling factor: 1-4
-        ctx->comp[i].v  = hv & 0xf;             // vertical sampling factor: 1-4
-        ctx->comp[i].tq = get_1byte(ctx);       // quantization table id: 0-3
-        hmax = max(hmax, ctx->comp[i].h);
-        vmax = max(vmax, ctx->comp[i].v);
-        printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, ctx->comp[i].tq);
+        int h  = ctx->comp[i].h  = hv >> 4;             // horizontal sampling factor: 1-4
+        int v  = ctx->comp[i].v  = hv & 0xf;            // vertical sampling factor: 1-4
+        int tq = ctx->comp[i].tq = get_1byte(ctx);      // quantization table id: 0-3
+        hmax = max(hmax, h);
+        vmax = max(vmax, v);
+        printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, tq);
     }
 
     ctx->mcu_x = 8 * hmax;
     ctx->mcu_y = 8 * vmax;
     ctx->h_mcus = (ctx->x + (ctx->mcu_x - 1)) / ctx->mcu_x;
     ctx->v_mcus = (ctx->y + (ctx->mcu_y - 1)) / ctx->mcu_y;
+
+    for (int i = 0; i < ctx->comp_n; i++) {
+        ctx->comp[i].coeff = new int16_t[64 * ctx->comp[i].h * ctx->comp[i].v * ctx->h_mcus * ctx->v_mcus]{};       // initialized
+    }
 }
 
 void create_huffman_tree(context* ctx)
@@ -400,7 +372,7 @@ void inverseDCT(int* blk)
     }
 }
 
-void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, uint8_t* out) {
+void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, int* out) {
     int H = ctx->comp[comp_i].h;
     out += (blk_i % H) * 8;         // x offset
     out += (blk_i / H) * (64 * H);  // y offset
@@ -413,7 +385,7 @@ void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, uint8_t* out) {
 }
 
 // nearest-neighbor
-void upsample(context *ctx, int comp_i, uint8_t* out) {
+void upsample(context *ctx, int comp_i, int* out) {
     int H = ctx->mcu_x / 8 / ctx->comp[comp_i].h;
     int V = ctx->mcu_y / 8 / ctx->comp[comp_i].v;
     if (H == 1 && V == 1)
@@ -426,29 +398,26 @@ void upsample(context *ctx, int comp_i, uint8_t* out) {
     }
 }
 
-void decode_mcu(context* ctx, int mcu_idx) {
-    int mcu_size = ctx->mcu_x * ctx->mcu_y;
-    int data[64];
-    uint8_t* out;
+void load_DCT_coeff(context* ctx) {
+    for (int mcu_i = 0; mcu_i < ctx->h_mcus * ctx->v_mcus; mcu_i++) {
+        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
 
-    for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+            int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+            int16_t* out = ctx->comp[comp_i].coeff + mcu_i * 64 * block_n;
 
-        out = ctx->comp[comp_i].data + mcu_size * mcu_idx;
-        int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+            for (int blk_i = 0; blk_i < block_n; blk_i++) {
+                int data[64] = {0};
 
-        for (int blk_i = 0; blk_i < block_n; blk_i++) {
-            memset(data, 0, sizeof(data));
+                load_huffman_DC(ctx, data, comp_i);
+                load_huffman_AC(ctx, data, comp_i);
+                dequantization(data, ctx->q_table[ctx->comp[comp_i].tq]);
 
-            load_huffman_DC(ctx, data, comp_i);
-            load_huffman_AC(ctx, data, comp_i);
-            dequantization(data, ctx->q_table[ctx->comp[comp_i].tq]);
-            inverseDCT(data);
-
-            copy_to_mcu(ctx, comp_i, blk_i, data, out);
+                copy(data, data + 64, out);
+                out += 64;
+            }
         }
-
-        upsample(ctx, comp_i, out);
     }
+    clearbit(ctx);
 }
 
 void YCbCr_to_RGB(uint8_t* in, uint8_t* out)
@@ -461,23 +430,30 @@ void YCbCr_to_RGB(uint8_t* in, uint8_t* out)
     out[2] = clamp(round(Y + 1.772  * (Cb - 128)                      ));   // B
 }
 
-void output_to_pixel(context* ctx, uint8_t* out)
+void output_to_pixel(context* ctx, int mcu_i, int data[3][32*32], uint8_t* pixel)
 {
     uint8_t in[3];
 
-    for (int y = 0; y < ctx->y; y++) {
-        for (int x = 0; x < ctx->x; x++) {
-            int mcu_idx = (y / ctx->mcu_y * ctx->h_mcus) + (x / ctx->mcu_x);
-            int offset = ((y % ctx->mcu_y) * ctx->mcu_x) + (x % ctx->mcu_x);
-            int pos = (ctx->mcu_x * ctx->mcu_y) * mcu_idx + offset;
+    int mcu_pos_x = mcu_i % ctx->h_mcus;
+    int mcu_pos_y = mcu_i / ctx->h_mcus;
+
+    for (int y = 0; y < ctx->mcu_y; y++) {
+
+        uint8_t* out = pixel + ((mcu_pos_y * ctx->mcu_y + y) * ctx->x + mcu_pos_x * ctx->mcu_x) * ctx->comp_n;
+
+        if (mcu_pos_y * ctx->mcu_y + y >= ctx->y) break;
+
+        for (int x = 0; x < ctx->mcu_x; x++) {
+
+            if (mcu_pos_x * ctx->mcu_x + x >= ctx->x) break;
 
             if (ctx->comp_n == 1) {
-                *out = ctx->comp[0].data[pos];
+                *out = data[0][ctx->mcu_x * y + x];
                 out += 1;
             } else {    // comp_n == 3
-                in[0] = ctx->comp[0].data[pos];
-                in[1] = ctx->comp[1].data[pos];
-                in[2] = ctx->comp[2].data[pos];
+                in[0] = data[0][ctx->mcu_x * y + x];
+                in[1] = data[1][ctx->mcu_x * y + x];
+                in[2] = data[2][ctx->mcu_x * y + x];
 
                 YCbCr_to_RGB(in, out);
                 out += 3;
@@ -487,7 +463,7 @@ void output_to_pixel(context* ctx, uint8_t* out)
 }
 
 // Scan header
-uint8_t* parse_SOS(context* ctx) {
+void parse_SOS(context* ctx) {
     printf("[SOS]\n");
     get_2byte(ctx);                         // header length
     uint8_t Ns = get_1byte(ctx);            // number of image components in scan: 1-4
@@ -504,35 +480,14 @@ uint8_t* parse_SOS(context* ctx) {
     get_1byte(ctx);                         // end of spectral selection
     get_1byte(ctx);                         // successive approximation bit position
 
-    for (int i = 0; i < ctx->comp_n; i++) {
-        int size = (ctx->mcu_x * ctx->h_mcus) * (ctx->mcu_y * ctx->v_mcus);
-        ctx->comp[i].data = new uint8_t[size];
-    }
-
-    for (int i = 0; i < ctx->h_mcus * ctx->v_mcus; i++) {
-        decode_mcu(ctx, i);
-    }
-
-    clearbit(ctx);
-    int marker = get_marker(ctx);
-    if (marker != 0xd9) {       // EOI
-        ERROR("unsupported marker %02x", marker);
-        exit(1);
-    }
-
-    int size = ctx->x * ctx->y * ctx->comp_n;
-    uint8_t* pixel = new uint8_t[size];
-    output_to_pixel(ctx, pixel);
-
-    return pixel;
+    load_DCT_coeff(ctx);
 }
 
-uint8_t* decode_jpeg(context* ctx)
+void parse_jpeg(context* ctx)
 {
     int signature = get_2byte(ctx);
     if (signature != 0xffd8) {
         ERROR("not jpeg file");
-        exit(1);
     }
     while (1) {
         int marker = get_marker(ctx);
@@ -550,7 +505,11 @@ uint8_t* decode_jpeg(context* ctx)
                 parse_DHT(ctx);
                 break;
             case 0xda:
-                return parse_SOS(ctx);
+                parse_SOS(ctx);
+                break;
+            case 0xd9:
+                printf("[EOI]\n");
+                return;
             default:
                 if (0xe0 <= marker && marker <= 0xffef) {
                     printf("[APP%d]\n", marker & 0xf);
@@ -559,8 +518,68 @@ uint8_t* decode_jpeg(context* ctx)
                     break;
                 }
                 ERROR("unkown marker 0x%02x", marker);
-                exit(1);
         }
     }
-    return 0;
 }
+
+uint8_t* convert_to_pixel_data(context* ctx)
+{
+    int data[3][32*32];
+    int buf[64];
+
+    int size = ctx->x * ctx->y * ctx->comp_n;
+    uint8_t* pixels = new uint8_t[size];
+
+    for (int mcu_i = 0; mcu_i < ctx->h_mcus * ctx->v_mcus; mcu_i++) {
+        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+
+            int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+            int16_t* p = ctx->comp[comp_i].coeff + mcu_i * 64 * block_n;
+
+            for (int blk_i = 0; blk_i < block_n; blk_i++) {
+
+                copy(p, p + 64, buf);
+                inverseDCT(buf);
+
+                copy_to_mcu(ctx, comp_i, blk_i, buf, data[comp_i]);
+                p += 64;
+            }
+            upsample(ctx, comp_i, data[comp_i]);
+        }
+        output_to_pixel(ctx, mcu_i, data, pixels);
+    }
+    return pixels;
+}
+
+uint8_t* decode_jpeg(context* ctx)
+{
+    parse_jpeg(ctx);                    // decode entropy coded segments
+    return convert_to_pixel_data(ctx);
+}
+
+uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel)
+{
+    initialize_table();
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) {
+        ERROR("%s", strerror(errno));
+    }
+    context ctx = {};
+    ctx.fp = fp;
+
+    uint8_t* data = decode_jpeg(&ctx);
+    *width = ctx.x;
+    *height = ctx.y;
+    *channel = ctx.comp_n;
+
+    fclose(fp);
+    for (int i = 0; i < 2; i++) {
+        destroy_huffman_tree(ctx.huffman_DC[i]);
+        destroy_huffman_tree(ctx.huffman_AC[i]);
+    }
+    for (int i = 0; i < ctx.comp_n; i++) {
+        delete[] ctx.comp[i].coeff;
+    }
+    return data;
+}
+
