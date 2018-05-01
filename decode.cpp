@@ -76,12 +76,11 @@ struct context {
     node* huffman_AC[2];    // AC huffman tree [id]
     int prev_dc_val[3];     // previous block DC value [component]
 
-    int x;                  // image width
-    int y;                  // image height
-    int mcu_x;              // MCU width
-    int mcu_y;              // MCU height
-    int h_mcus;             // number of MCUs in horizontal direction
-    int v_mcus;             // number of MCUs in vertical direction
+    int width;              // image width
+    int height;             // image height
+    int mcu_w;              // MCU width
+    int mcu_h;              // MCU height
+    int mcu_n;              // number of total MCUs
     int comp_n;             // number of components: 1 or 3
     struct {
         int h;              // horizontal sampling factor
@@ -210,11 +209,11 @@ void parse_SOF0(context* ctx)
     printf("[SOF0]\n");
     get_2byte(ctx);                             // header length
     get_1byte(ctx);                             // precision: 8
-    ctx->y = get_2byte(ctx);                    // number of lines
-    ctx->x = get_2byte(ctx);                    // number of samples per line
+    ctx->height = get_2byte(ctx);               // number of lines
+    ctx->width = get_2byte(ctx);                // number of samples per line
     ctx->comp_n = get_1byte(ctx);               // number of image components: 1-255 (JFIF : 1 or 3)
 
-    printf("  width:%d, height:%d, comp_n:%d\n", ctx->x, ctx->y, ctx->comp_n);
+    printf("  width:%d, height:%d, comp_n:%d\n", ctx->width, ctx->height, ctx->comp_n);
     if (ctx->comp_n != 1 && ctx->comp_n != 3) {
         ERROR("comp_n %d not supported", ctx->comp_n);
     }
@@ -232,13 +231,14 @@ void parse_SOF0(context* ctx)
         printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, tq);
     }
 
-    ctx->mcu_x = 8 * hmax;
-    ctx->mcu_y = 8 * vmax;
-    ctx->h_mcus = (ctx->x + (ctx->mcu_x - 1)) / ctx->mcu_x;
-    ctx->v_mcus = (ctx->y + (ctx->mcu_y - 1)) / ctx->mcu_y;
+    ctx->mcu_w = 8 * hmax;
+    ctx->mcu_h = 8 * vmax;
+    int n1 = (ctx->width + (ctx->mcu_w - 1)) / ctx->mcu_w;
+    int n2 = (ctx->height + (ctx->mcu_h - 1)) / ctx->mcu_h;
+    ctx->mcu_n = n1 * n2;
 
     for (int i = 0; i < ctx->comp_n; i++) {
-        ctx->comp[i].coeff = new int16_t[64 * ctx->comp[i].h * ctx->comp[i].v * ctx->h_mcus * ctx->v_mcus]{};       // initialized
+        ctx->comp[i].coeff = new int16_t[64 * ctx->comp[i].h * ctx->comp[i].v * ctx->mcu_n]{};       // initialized
     }
 }
 
@@ -379,27 +379,27 @@ void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, int* out) {
 
     for (int y = 0; y < 8; y++) {
         for (int x = 0 ; x < 8; x++) {
-            out[y * ctx->mcu_x + x] = data[y * 8 + x];
+            out[y * ctx->mcu_w + x] = data[y * 8 + x];
         }
     }
 }
 
 // nearest-neighbor
 void upsample(context *ctx, int comp_i, int* out) {
-    int H = ctx->mcu_x / 8 / ctx->comp[comp_i].h;
-    int V = ctx->mcu_y / 8 / ctx->comp[comp_i].v;
+    int H = ctx->mcu_w / 8 / ctx->comp[comp_i].h;
+    int V = ctx->mcu_h / 8 / ctx->comp[comp_i].v;
     if (H == 1 && V == 1)
         return;
 
-    for (int y = ctx->mcu_y - 1; y >= 0; y--) {
-        for (int x = ctx->mcu_x - 1; x >= 0; x--) {
-            out[(y * ctx->mcu_x) + x] = out[(y / V * ctx->mcu_x) + x / H];
+    for (int y = ctx->mcu_h - 1; y >= 0; y--) {
+        for (int x = ctx->mcu_w - 1; x >= 0; x--) {
+            out[(y * ctx->mcu_w) + x] = out[(y / V * ctx->mcu_w) + x / H];
         }
     }
 }
 
 void load_DCT_coeff(context* ctx) {
-    for (int mcu_i = 0; mcu_i < ctx->h_mcus * ctx->v_mcus; mcu_i++) {
+    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
         for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
 
             int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
@@ -434,26 +434,27 @@ void output_to_pixel(context* ctx, int mcu_i, int data[3][32*32], uint8_t* pixel
 {
     uint8_t in[3];
 
-    int mcu_pos_x = mcu_i % ctx->h_mcus;
-    int mcu_pos_y = mcu_i / ctx->h_mcus;
+    int hmcu_n = (ctx->width + ctx->mcu_w - 1) / ctx->mcu_w;    // number of MCUs in horizontal direction
+    int mcu_x = mcu_i % hmcu_n;
+    int mcu_y = mcu_i / hmcu_n;
 
-    for (int y = 0; y < ctx->mcu_y; y++) {
+    for (int y = 0; y < ctx->mcu_h; y++) {
 
-        uint8_t* out = pixel + ((mcu_pos_y * ctx->mcu_y + y) * ctx->x + mcu_pos_x * ctx->mcu_x) * ctx->comp_n;
+        uint8_t* out = pixel + ((mcu_y * ctx->mcu_h + y) * ctx->width + mcu_x * ctx->mcu_w) * ctx->comp_n;
 
-        if (mcu_pos_y * ctx->mcu_y + y >= ctx->y) break;
+        if (mcu_y * ctx->mcu_h + y >= ctx->height) break;
 
-        for (int x = 0; x < ctx->mcu_x; x++) {
+        for (int x = 0; x < ctx->mcu_w; x++) {
 
-            if (mcu_pos_x * ctx->mcu_x + x >= ctx->x) break;
+            if (mcu_x * ctx->mcu_w + x >= ctx->width) break;
 
             if (ctx->comp_n == 1) {
-                *out = data[0][ctx->mcu_x * y + x];
+                *out = data[0][ctx->mcu_w * y + x];
                 out += 1;
             } else {    // comp_n == 3
-                in[0] = data[0][ctx->mcu_x * y + x];
-                in[1] = data[1][ctx->mcu_x * y + x];
-                in[2] = data[2][ctx->mcu_x * y + x];
+                in[0] = data[0][ctx->mcu_w * y + x];
+                in[1] = data[1][ctx->mcu_w * y + x];
+                in[2] = data[2][ctx->mcu_w * y + x];
 
                 YCbCr_to_RGB(in, out);
                 out += 3;
@@ -527,10 +528,10 @@ uint8_t* convert_to_pixel_data(context* ctx)
     int data[3][32*32];
     int buf[64];
 
-    int size = ctx->x * ctx->y * ctx->comp_n;
+    int size = ctx->width * ctx->height * ctx->comp_n;
     uint8_t* pixels = new uint8_t[size];
 
-    for (int mcu_i = 0; mcu_i < ctx->h_mcus * ctx->v_mcus; mcu_i++) {
+    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
         for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
 
             int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
@@ -568,8 +569,8 @@ uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel)
     ctx.fp = fp;
 
     uint8_t* data = decode_jpeg(&ctx);
-    *width = ctx.x;
-    *height = ctx.y;
+    *width   = ctx.width;
+    *height  = ctx.height;
     *channel = ctx.comp_n;
 
     fclose(fp);
@@ -582,4 +583,3 @@ uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel)
     }
     return data;
 }
-
