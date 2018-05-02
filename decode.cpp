@@ -75,6 +75,7 @@ struct context {
     node* huffman_DC[2];    // DC huffman tree [id]
     node* huffman_AC[2];    // AC huffman tree [id]
     int prev_dc_val[3];     // previous block DC value [component]
+    bool is_progressive;
 
     int width;              // image width
     int height;             // image height
@@ -88,7 +89,7 @@ struct context {
         int tq;             // quantization table id: 0-3
         int td;             // DC huffman table id: 0-1
         int ta;             // AC huffman table id: 0-1
-        int16_t* coeff;     // DCT coefficients
+        int16_t* coeff;     // quantized DCT coefficients
     } comp[3];              // components 0:Y, 1:Cb, 2:Cr
 };
 
@@ -162,7 +163,7 @@ void parse_JFIF(context* ctx, int /* len */)
     int v_thumbnail = get_1byte(ctx);   // thumbnail height (may be 0)
     skip_byte(ctx, h_thumbnail * v_thumbnail * 3);  // thumbnail 24bit RGB values (optional)
 
-    printf("JFIF ver:%04x\n", version);
+    printf("  JFIF ver:%04x\n", version);
     printf("  density unit:%d (0:x,1:dpi,2:dpcm), H:%d, V:%d\n", units, h_density, v_density);
     printf("  thumbnail width:%d, height:%d\n", h_thumbnail, v_thumbnail);
 }
@@ -186,6 +187,16 @@ void parse_APP0(context* ctx)
     ERROR("not JFIF");
 }
 
+void dump_table(uint8_t* p)
+{
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            printf(" %3d", p[8 * i + j]);
+        }
+        puts("");
+    }
+}
+
 // Quantization table
 void parse_DQT(context* ctx)
 {
@@ -199,19 +210,20 @@ void parse_DQT(context* ctx)
         assert(Pq == 0);
         for (int n = 0; n < 64; n++)
             ctx->q_table[Tq][ZZ[n]] = get_1byte(ctx);   // element (zigzag ordering)
+
         printf("  table:%d\n", Tq);
+        dump_table(ctx->q_table[Tq]);
     }
 }
 
-// Frame header (Baseline DCT)
-void parse_SOF0(context* ctx)
+// Frame header
+void parse_SOF(context* ctx)
 {
-    printf("[SOF0]\n");
     get_2byte(ctx);                             // header length
     get_1byte(ctx);                             // precision: 8
     ctx->height = get_2byte(ctx);               // number of lines
     ctx->width = get_2byte(ctx);                // number of samples per line
-    ctx->comp_n = get_1byte(ctx);               // number of image components: 1-255 (JFIF : 1 or 3)
+    ctx->comp_n = get_1byte(ctx);               // number of image components: 1/3 (JFIF)
 
     printf("  width:%d, height:%d, comp_n:%d\n", ctx->width, ctx->height, ctx->comp_n);
     if (ctx->comp_n != 1 && ctx->comp_n != 3) {
@@ -221,14 +233,15 @@ void parse_SOF0(context* ctx)
     int hmax = 1;
     int vmax = 1;
     for (int i = 0; i < ctx->comp_n; i++) {
-        get_1byte(ctx);                                 // component id: 0-255 (JFIF : Y=1,Cb=2,Cr=3)
+        int cid = get_1byte(ctx);                       // component id: Y=1,Cb=2,Cr=3 (JFIF)
         int hv = get_1byte(ctx);
         int h  = ctx->comp[i].h  = hv >> 4;             // horizontal sampling factor: 1-4
         int v  = ctx->comp[i].v  = hv & 0xf;            // vertical sampling factor: 1-4
         int tq = ctx->comp[i].tq = get_1byte(ctx);      // quantization table id: 0-3
         hmax = max(hmax, h);
         vmax = max(vmax, v);
-        printf("  component i:%d, hv:%02x, q_table:%d\n", i, hv, tq);
+        printf("  component id:%d, hv:%02x, q_table:%d\n", cid, hv, tq);
+        if (cid != i + 1) ERROR("component id %d unmatch", cid);
     }
 
     ctx->mcu_w = 8 * hmax;
@@ -398,7 +411,7 @@ void upsample(context *ctx, int comp_i, int* out) {
     }
 }
 
-void load_DCT_coeff(context* ctx) {
+void decode_entropy_sequential(context* ctx) {
     for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
         for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
 
@@ -410,9 +423,27 @@ void load_DCT_coeff(context* ctx) {
 
                 load_huffman_DC(ctx, data, comp_i);
                 load_huffman_AC(ctx, data, comp_i);
-                dequantization(data, ctx->q_table[ctx->comp[comp_i].tq]);
 
                 copy(data, data + 64, out);
+                out += 64;
+            }
+        }
+    }
+    clearbit(ctx);
+}
+
+void decode_entropy_progressive_DC(context* ctx, int al)
+{
+    int data[64] = {};
+    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
+        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+
+            int blk_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+            int16_t* out = ctx->comp[comp_i].coeff + mcu_i * 64 * blk_n;
+
+            for (int blk_i = 0; blk_i < blk_n; blk_i++) {
+                load_huffman_DC(ctx, data, comp_i);
+                *out = data[0] << al;
                 out += 64;
             }
         }
@@ -467,21 +498,32 @@ void output_to_pixel(context* ctx, int mcu_i, int data[3][32*32], uint8_t* pixel
 void parse_SOS(context* ctx) {
     printf("[SOS]\n");
     get_2byte(ctx);                         // header length
-    uint8_t Ns = get_1byte(ctx);            // number of image components in scan: 1-4
-    assert(Ns == 1 || Ns == 3);
-    for (int i = 0; i < Ns; i++) {
-        get_1byte(ctx);                     // component id
-        uint8_t T = get_1byte(ctx);
-        ctx->comp[i].td = T >> 4;           // DC huffman table id: 0-1
-        ctx->comp[i].ta = T & 0xf;          // AC huffman table id: 0-1
-        printf("  component i:%d, huff_table DC:%d, AC:%d\n", i, T >> 4, T & 0xf);
-    }
-                                            // (for progressive/lossless?)
-    get_1byte(ctx);                         // start of spectral
-    get_1byte(ctx);                         // end of spectral selection
-    get_1byte(ctx);                         // successive approximation bit position
+    uint8_t ns = get_1byte(ctx);            // number of image components in scan: 1-4
+    if (ns != 1 && ns != 3) ERROR("%d components not supported", ns);
 
-    load_DCT_coeff(ctx);
+    for (int i = 0; i < ns; i++) {
+        int cid = get_1byte(ctx);           // component id
+        uint8_t T = get_1byte(ctx);
+        int td = ctx->comp[i].td = T >> 4;           // DC huffman table id: 0-1
+        int ta = ctx->comp[i].ta = T & 0xf;          // AC huffman table id: 0-1
+        printf("  component id:%d, huff_table DC:%d, AC:%d\n", cid, td, ta);
+    }
+    int ss = get_1byte(ctx);                // start of spectral selection
+    int se = get_1byte(ctx);                // end of spectral selection
+    int A = get_1byte(ctx);
+    int ah = A >> 4;                        // successive approximation bit position high
+    int al = A & 0xf;                       // successive approximation bit position low (point transform): 0-13
+    printf("  spectral:%d-%d, ah:%d, al:%d\n", ss, se, ah, al);
+
+
+    if (ctx->is_progressive) {
+        if (ss == 0) {
+            decode_entropy_progressive_DC(ctx, al);
+        } else {
+        }
+    } else {
+        decode_entropy_sequential(ctx);
+    }
 }
 
 void parse_jpeg(context* ctx)
@@ -490,6 +532,7 @@ void parse_jpeg(context* ctx)
     if (signature != 0xffd8) {
         ERROR("not jpeg file");
     }
+    int debug_scan = 0;
     while (1) {
         int marker = get_marker(ctx);
         switch (marker) {
@@ -500,13 +543,20 @@ void parse_jpeg(context* ctx)
                 parse_DQT(ctx);
                 break;
             case 0xc0:
-                parse_SOF0(ctx);
+                printf("[SOF0] Baseline DCT\n");
+                parse_SOF(ctx);
+                break;
+            case 0xc2:
+                printf("[SOF2] Progressive DCT, Huffman coding\n");
+                parse_SOF(ctx);
+                ctx->is_progressive = true;
                 break;
             case 0xc4:
                 parse_DHT(ctx);
                 break;
             case 0xda:
                 parse_SOS(ctx);
+                if (++debug_scan == 1) { printf("debug\n"); return; }
                 break;
             case 0xd9:
                 printf("[EOI]\n");
@@ -540,6 +590,7 @@ uint8_t* convert_to_pixel_data(context* ctx)
             for (int blk_i = 0; blk_i < block_n; blk_i++) {
 
                 copy(p, p + 64, buf);
+                dequantization(buf, ctx->q_table[ctx->comp[comp_i].tq]);
                 inverseDCT(buf);
 
                 copy_to_mcu(ctx, comp_i, blk_i, buf, data[comp_i]);
