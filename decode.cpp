@@ -105,6 +105,7 @@ void skip_byte(context* ctx, int len)
 
 int get_1byte(context* ctx)
 {
+    assert(ctx->_cnt == 0);
     return fgetc(ctx->fp);
 }
 
@@ -124,13 +125,13 @@ int nextbit(context* ctx)
 {
     if (ctx->_cnt == 0) {
         ctx->_byte = get_1byte(ctx);
-        ctx->_cnt = 8;
         if (ctx->_byte == 0xff) {
             int x = get_1byte(ctx);
             if (x != 0) {           // not stuffing byte
                 ERROR("found marker 0x%02x in compressed image data", x);
             }
         }
+        ctx->_cnt = 8;
     }
     ctx->_cnt--;
     return (ctx->_byte >> ctx->_cnt) & 1;
@@ -140,6 +141,17 @@ void clearbit(context* ctx)
 {
     ctx->_byte = 0;
     ctx->_cnt = 0;
+}
+
+// read next n bits from stream
+int get_bits(context* ctx, int size)
+{
+    assert(size <= 16);
+    int x = 0;
+    for (int i = 0; i < size; i++) {
+        x = (x << 1) | nextbit(ctx);
+    }
+    return x;
 }
 
 int get_marker(context* ctx)
@@ -204,15 +216,14 @@ void parse_DQT(context* ctx)
     int len = get_2byte(ctx) - 2;
     int table_count = len / 65;
     for (int i = 0; i < table_count; i++) {
-        int x = get_1byte(ctx);
-        int Pq = x >> 4;                        // precision: 0(=8bit)
-        int Tq = x & 0xf;                       // table id: 0-3
-        assert(Pq == 0);
+        int pq = get_bits(ctx, 4);                      // precision: 0(=8bit)
+        int tq = get_bits(ctx, 4);                      // table id: 0-3
+        assert(pq == 0);
         for (int n = 0; n < 64; n++)
-            ctx->q_table[Tq][ZZ[n]] = get_1byte(ctx);   // element (zigzag ordering)
+            ctx->q_table[tq][ZZ[n]] = get_1byte(ctx);   // element (zigzag ordering)
 
-        printf("  table:%d\n", Tq);
-        dump_table(ctx->q_table[Tq]);
+        printf("  table:%d\n", tq);
+        dump_table(ctx->q_table[tq]);
     }
 }
 
@@ -234,13 +245,12 @@ void parse_SOF(context* ctx)
     int vmax = 1;
     for (int i = 0; i < ctx->comp_n; i++) {
         int cid = get_1byte(ctx);                       // component id: Y=1,Cb=2,Cr=3 (JFIF)
-        int hv = get_1byte(ctx);
-        int h  = ctx->comp[i].h  = hv >> 4;             // horizontal sampling factor: 1-4
-        int v  = ctx->comp[i].v  = hv & 0xf;            // vertical sampling factor: 1-4
+        int h  = ctx->comp[i].h  = get_bits(ctx, 4);    // horizontal sampling factor: 1-4
+        int v  = ctx->comp[i].v  = get_bits(ctx, 4);    // vertical sampling factor: 1-4
         int tq = ctx->comp[i].tq = get_1byte(ctx);      // quantization table id: 0-3
         hmax = max(hmax, h);
         vmax = max(vmax, v);
-        printf("  component id:%d, hv:%02x, q_table:%d\n", cid, hv, tq);
+        printf("  component id:%d, h:%d, v:%d, q_table:%d\n", cid, h, v, tq);
         if (cid != i + 1) ERROR("component id %d unmatch", cid);
     }
 
@@ -257,16 +267,15 @@ void parse_SOF(context* ctx)
 
 void create_huffman_tree(context* ctx)
 {
-    int x = get_1byte(ctx);
-    int Tc = x >> 4;                // table class: 0(=DC table), 1(=AC table)
-    int Th = x & 0xf;               // huffman table id: 0-1
-    printf("  class:%d (0:DC,1:AC), table:%d\n", Tc, Th);
+    int tc = get_bits(ctx, 4);      // table class: 0(=DC table), 1(=AC table)
+    int th = get_bits(ctx, 4);     // huffman table id: 0-1
+    printf("  class:%d (0:DC,1:AC), table:%d\n", tc, th);
 
     int L[16];
     for (int i = 0; i < 16; i++)
         L[i] = get_1byte(ctx);      // number of huffman codes of length i
 
-    node*& root = (Tc == 0) ? ctx->huffman_DC[Th] : ctx->huffman_AC[Th];
+    node*& root = (tc == 0) ? ctx->huffman_DC[th] : ctx->huffman_AC[th];
     root = new node{NULL, NULL, 0};
 
     int code = 0;
@@ -307,16 +316,6 @@ int decode_huffman_tree(context* ctx, node* root)
     return p->val;
 }
 
-// read next n bits from stream
-int receive(context* ctx, int size)
-{
-    int x = 0;
-    for (int i = 0; i < size; i++) {
-        x = (x << 1) | nextbit(ctx);
-    }
-    return x;
-}
-
 // convert to equivalent signed value
 int extend(int v, int size) {
     if ((v >> (size - 1)) ^ 1)      // MSB == '0'
@@ -327,7 +326,7 @@ int extend(int v, int size) {
 void load_huffman_DC(context* ctx, int* blk, int comp_idx) {
     int table_id = ctx->comp[comp_idx].td;
     int size = decode_huffman_tree(ctx, ctx->huffman_DC[table_id]);
-    int x = receive(ctx, size);
+    int x = get_bits(ctx, size);
     x = extend(x, size);
 
     x += ctx->prev_dc_val[comp_idx];
@@ -350,7 +349,7 @@ void load_huffman_AC(context* ctx, int* blk, int comp_idx) {
         }
         i += run;
 
-        int x = receive(ctx, size);
+        int x = get_bits(ctx, size);
         x = extend(x, size);
 
         blk[ZZ[i++]] = x;
@@ -502,19 +501,16 @@ void parse_SOS(context* ctx) {
     if (ns != 1 && ns != 3) ERROR("%d components not supported", ns);
 
     for (int i = 0; i < ns; i++) {
-        int cid = get_1byte(ctx);           // component id
-        uint8_t T = get_1byte(ctx);
-        int td = ctx->comp[i].td = T >> 4;           // DC huffman table id: 0-1
-        int ta = ctx->comp[i].ta = T & 0xf;          // AC huffman table id: 0-1
+        int cid = get_1byte(ctx);                       // component id
+        int td = ctx->comp[i].td = get_bits(ctx, 4);    // DC huffman table id: 0-1
+        int ta = ctx->comp[i].ta = get_bits(ctx, 4);    // AC huffman table id: 0-1
         printf("  component id:%d, huff_table DC:%d, AC:%d\n", cid, td, ta);
     }
     int ss = get_1byte(ctx);                // start of spectral selection
     int se = get_1byte(ctx);                // end of spectral selection
-    int A = get_1byte(ctx);
-    int ah = A >> 4;                        // successive approximation bit position high
-    int al = A & 0xf;                       // successive approximation bit position low (point transform): 0-13
+    int ah = get_bits(ctx, 4);              // successive approximation bit position high
+    int al = get_bits(ctx, 4);              // successive approximation bit position low (point transform): 0-13
     printf("  spectral:%d-%d, ah:%d, al:%d\n", ss, se, ah, al);
-
 
     if (ctx->is_progressive) {
         if (ss == 0) {
