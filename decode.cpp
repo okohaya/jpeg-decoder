@@ -93,6 +93,15 @@ struct context {
     } comp[3];              // components 0:Y, 1:Cb, 2:Cr
 };
 
+struct scan_info {
+    int n;
+    struct {
+        int id;
+        int td;
+        int ta;
+    } comp[3];
+};
+
 int get_pos(context* ctx)
 {
     return ftell(ctx->fp);
@@ -410,9 +419,10 @@ void upsample(context *ctx, int comp_i, int* out) {
     }
 }
 
-void decode_entropy_sequential(context* ctx) {
+void decode_entropy_sequential(context* ctx, scan_info* info) {
     for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
-        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+        for (int i = 0; i < info->n; i++) {
+            int comp_i = info->comp[i].id - 1;
 
             int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
             int16_t* out = ctx->comp[comp_i].coeff + mcu_i * 64 * block_n;
@@ -425,6 +435,31 @@ void decode_entropy_sequential(context* ctx) {
 
                 copy(data, data + 64, out);
                 out += 64;
+            }
+        }
+    }
+    clearbit(ctx);
+}
+
+void decode_entropy_sequential_non_interleaved(context* ctx, scan_info* info) {
+    assert(info->n == 1);
+    int comp_i = info->comp[0].id - 1;
+    int H = ctx->comp[comp_i].h;
+    int V = ctx->comp[comp_i].v;
+    int mcu_in_row = (ctx->width + ctx->mcu_w - 1) / ctx->mcu_w;
+    int mcu_in_col = (ctx->height + ctx->mcu_h - 1) / ctx->mcu_h;
+
+    for (int mcu_y = 0; mcu_y < mcu_in_col; mcu_y++) {
+        for (int blk_y = 0; blk_y < V; blk_y++) {
+            for (int mcu_x = 0; mcu_x < mcu_in_row; mcu_x++) {
+                for (int blk_x = 0; blk_x < H; blk_x++) {
+                    int data[64] = {0};
+                    load_huffman_DC(ctx, data, comp_i);
+                    load_huffman_AC(ctx, data, comp_i);
+
+                    int16_t* out = ctx->comp[comp_i].coeff + (mcu_y * (64 * H * V * mcu_in_row)) + (blk_y * (64 * H)) + (mcu_x * (64 * H * V)) + (blk_x * 64);
+                    copy(data, data + 64, out);
+                }
             }
         }
     }
@@ -500,10 +535,15 @@ void parse_SOS(context* ctx) {
     uint8_t ns = get_1byte(ctx);            // number of image components in scan: 1-4
     if (ns != 1 && ns != 3) ERROR("%d components not supported", ns);
 
+    scan_info info;
+    info.n = ns;
+
     for (int i = 0; i < ns; i++) {
         int cid = get_1byte(ctx);                       // component id
-        int td = ctx->comp[i].td = get_bits(ctx, 4);    // DC huffman table id: 0-1
-        int ta = ctx->comp[i].ta = get_bits(ctx, 4);    // AC huffman table id: 0-1
+        if (cid < 1 || 3 < cid) ERROR("component id %d not supported", cid);
+        int td = ctx->comp[cid - 1].td = get_bits(ctx, 4);    // DC huffman table id: 0-1
+        int ta = ctx->comp[cid - 1].ta = get_bits(ctx, 4);    // AC huffman table id: 0-1
+        info.comp[i] = {cid, td, ta};
         printf("  component id:%d, huff_table DC:%d, AC:%d\n", cid, td, ta);
     }
     int ss = get_1byte(ctx);                // start of spectral selection
@@ -512,13 +552,18 @@ void parse_SOS(context* ctx) {
     int al = get_bits(ctx, 4);              // successive approximation bit position low (point transform): 0-13
     printf("  spectral:%d-%d, ah:%d, al:%d\n", ss, se, ah, al);
 
+    bool is_interleaved = (ns != 1);
+
     if (ctx->is_progressive) {
         if (ss == 0) {
             decode_entropy_progressive_DC(ctx, al);
         } else {
         }
     } else {
-        decode_entropy_sequential(ctx);
+        if (is_interleaved)
+            decode_entropy_sequential(ctx, &info);
+        else
+            decode_entropy_sequential_non_interleaved(ctx, &info);
     }
 }
 
@@ -552,7 +597,7 @@ void parse_jpeg(context* ctx)
                 break;
             case 0xda:
                 parse_SOS(ctx);
-                if (++debug_scan == 1) { printf("debug\n"); return; }
+                //if (++debug_scan == 1) { printf("debug\n"); return; }
                 break;
             case 0xd9:
                 printf("[EOI]\n");
