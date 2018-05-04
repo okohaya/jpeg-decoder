@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #include <algorithm>
+#include <vector>
 using namespace std;
 
 #define ERROR(fmt, ...) do { fprintf(stderr, "%s:%d %s(), error: " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__); exit(1); } while (0)
@@ -65,6 +66,14 @@ void huffman_tree_insert(node* root, int code, int bitsize, int val)
     p->val = val;
 }
 
+struct component_t {
+    int h;              // horizontal sampling factor
+    int v;              // vertical sampling factor
+    int tq;             // quantization table id: 0-3
+    int td;             // DC huffman table id: 0-1
+    int ta;             // AC huffman table id: 0-1
+    int16_t* coeff;     // quantized DCT coefficients
+};
 
 struct context {
     FILE* fp;               // input
@@ -77,20 +86,15 @@ struct context {
     int prev_dc_val[3];     // previous block DC value [component]
     bool is_progressive;
 
-    int width;              // image width
-    int height;             // image height
+    int img_width;          // visible image width
+    int img_height;         // visible image height
+    int width;              // actual width
+    int height;             // actual height
     int mcu_w;              // MCU width
     int mcu_h;              // MCU height
     int mcu_n;              // number of total MCUs
     int comp_n;             // number of components: 1 or 3
-    struct {
-        int h;              // horizontal sampling factor
-        int v;              // vertical sampling factor
-        int tq;             // quantization table id: 0-3
-        int td;             // DC huffman table id: 0-1
-        int ta;             // AC huffman table id: 0-1
-        int16_t* coeff;     // quantized DCT coefficients
-    } comp[3];              // components 0:Y, 1:Cb, 2:Cr
+    component_t comp[3];    // components 0:Y, 1:Cb, 2:Cr
 };
 
 struct scan_info {
@@ -241,11 +245,11 @@ void parse_SOF(context* ctx)
 {
     get_2byte(ctx);                             // header length
     get_1byte(ctx);                             // precision: 8
-    ctx->height = get_2byte(ctx);               // number of lines
-    ctx->width = get_2byte(ctx);                // number of samples per line
+    ctx->img_height = get_2byte(ctx);           // number of lines
+    ctx->img_width = get_2byte(ctx);            // number of samples per line
     ctx->comp_n = get_1byte(ctx);               // number of image components: 1/3 (JFIF)
 
-    printf("  width:%d, height:%d, comp_n:%d\n", ctx->width, ctx->height, ctx->comp_n);
+    printf("  img_width:%d, img_height:%d, comp_n:%d\n", ctx->img_width, ctx->img_height, ctx->comp_n);
     if (ctx->comp_n != 1 && ctx->comp_n != 3) {
         ERROR("comp_n %d not supported", ctx->comp_n);
     }
@@ -265,12 +269,14 @@ void parse_SOF(context* ctx)
 
     ctx->mcu_w = 8 * hmax;
     ctx->mcu_h = 8 * vmax;
-    int n1 = (ctx->width + (ctx->mcu_w - 1)) / ctx->mcu_w;
-    int n2 = (ctx->height + (ctx->mcu_h - 1)) / ctx->mcu_h;
+    int n1 = (ctx->img_width + (ctx->mcu_w - 1)) / ctx->mcu_w;
+    int n2 = (ctx->img_height + (ctx->mcu_h - 1)) / ctx->mcu_h;
+    ctx->width = n1 * ctx->mcu_w;
+    ctx->height = n2 * ctx->mcu_h;
     ctx->mcu_n = n1 * n2;
 
     for (int i = 0; i < ctx->comp_n; i++) {
-        ctx->comp[i].coeff = new int16_t[64 * ctx->comp[i].h * ctx->comp[i].v * ctx->mcu_n]{};       // initialized
+        ctx->comp[i].coeff = new int16_t[64 * ctx->comp[i].h * ctx->comp[i].v * ctx->mcu_n]();       // initialized
     }
 }
 
@@ -365,7 +371,7 @@ void load_huffman_AC(context* ctx, int* blk, int comp_idx) {
     }
 }
 
-void dequantization(int* blk, uint8_t* qtable) {
+void dequantization(int16_t* blk, uint8_t* qtable) {
     for (int i = 0; i < 64; i++) {
         blk[i] *= qtable[i];
     }
@@ -373,7 +379,7 @@ void dequantization(int* blk, uint8_t* qtable) {
 
 int clamp(int x) { return max(0, min(255, x)); }
 
-void inverseDCT(int* blk)
+void inverseDCT(int16_t* blk)
 {
     double* A = DCT_FACTOR;
     double tbl[64] = {};
@@ -393,48 +399,44 @@ void inverseDCT(int* blk)
     }
 }
 
-void copy_to_mcu(context* ctx, int comp_i, int blk_i, int* data, int* out) {
-    int H = ctx->comp[comp_i].h;
-    out += (blk_i % H) * 8;         // x offset
-    out += (blk_i / H) * (64 * H);  // y offset
-
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0 ; x < 8; x++) {
-            out[y * ctx->mcu_w + x] = data[y * 8 + x];
-        }
-    }
-}
-
 // nearest-neighbor
-void upsample(context *ctx, int comp_i, int* out) {
+void upsample(context *ctx, int comp_i, uint8_t* out) {
     int H = ctx->mcu_w / 8 / ctx->comp[comp_i].h;
     int V = ctx->mcu_h / 8 / ctx->comp[comp_i].v;
     if (H == 1 && V == 1)
         return;
 
-    for (int y = ctx->mcu_h - 1; y >= 0; y--) {
-        for (int x = ctx->mcu_w - 1; x >= 0; x--) {
-            out[(y * ctx->mcu_w) + x] = out[(y / V * ctx->mcu_w) + x / H];
+    for (int y = ctx->height - 1; y >= 0; y--) {
+        for (int x = ctx->width - 1; x >= 0; x--) {
+            out[y * ctx->width + x] = out[((y / V) * ctx->width + x) / H];
         }
     }
 }
 
-void decode_entropy_sequential(context* ctx, scan_info* info) {
-    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
-        for (int i = 0; i < info->n; i++) {
-            int comp_i = info->comp[i].id - 1;
+void decode_entropy_sequential(context* ctx, scan_info* info)
+{
+    int h_mcus = ctx->width / ctx->mcu_w;
+    int v_mcus = ctx->height / ctx->mcu_h;
 
-            int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
-            int16_t* out = ctx->comp[comp_i].coeff + mcu_i * 64 * block_n;
+    for (int mcu_y = 0; mcu_y < v_mcus; mcu_y++) {
+        for (int mcu_x = 0; mcu_x < h_mcus; mcu_x++) {
+            for (int i = 0; i < info->n; i++) {
+                int comp_i = info->comp[i].id - 1;
+                int H = ctx->comp[comp_i].h;
+                int V = ctx->comp[comp_i].v;
+                int mcu_offset = (mcu_y * ((64 * H * V) * h_mcus)) + (mcu_x * (64 * H));
 
-            for (int blk_i = 0; blk_i < block_n; blk_i++) {
-                int data[64] = {0};
+                for (int blk_y = 0; blk_y < V; blk_y++) {
+                    for (int blk_x = 0; blk_x < H; blk_x++) {
+                        int data[64] = {0};
+                        load_huffman_DC(ctx, data, comp_i);
+                        load_huffman_AC(ctx, data, comp_i);
 
-                load_huffman_DC(ctx, data, comp_i);
-                load_huffman_AC(ctx, data, comp_i);
-
-                copy(data, data + 64, out);
-                out += 64;
+                        int blk_offset = (blk_y * (64 * h_mcus * H)) + (blk_x * 64);
+                        int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
+                        copy(data, data + 64, out);
+                    }
+                }
             }
         }
     }
@@ -446,22 +448,19 @@ void decode_entropy_sequential_non_interleaved(context* ctx, scan_info* info) {
     int comp_i = info->comp[0].id - 1;
     int H = ctx->comp[comp_i].h;
     int V = ctx->comp[comp_i].v;
-    int mcu_in_row = (ctx->width + ctx->mcu_w - 1) / ctx->mcu_w;
-    int mcu_in_col = (ctx->height + ctx->mcu_h - 1) / ctx->mcu_h;
+    int h_mcus = ctx->width / ctx->mcu_w;
+    int v_mcus = ctx->height / ctx->mcu_h;
 
-    for (int mcu_y = 0; mcu_y < mcu_in_col; mcu_y++) {
-        for (int blk_y = 0; blk_y < V; blk_y++) {
-            for (int mcu_x = 0; mcu_x < mcu_in_row; mcu_x++) {
-                for (int blk_x = 0; blk_x < H; blk_x++) {
-                    int data[64] = {0};
-                    load_huffman_DC(ctx, data, comp_i);
-                    load_huffman_AC(ctx, data, comp_i);
+    int cnt = h_mcus * H * v_mcus * V;
+    int16_t* out = ctx->comp[comp_i].coeff;
 
-                    int16_t* out = ctx->comp[comp_i].coeff + (mcu_y * (64 * H * V * mcu_in_row)) + (blk_y * (64 * H)) + (mcu_x * (64 * H * V)) + (blk_x * 64);
-                    copy(data, data + 64, out);
-                }
-            }
-        }
+    for (int i = 0; i < cnt; i++) {
+        int data[64] = {0};
+        load_huffman_DC(ctx, data, comp_i);
+        load_huffman_AC(ctx, data, comp_i);
+
+        copy(data, data + 64, out);
+        out += 64;
     }
     clearbit(ctx);
 }
@@ -495,31 +494,25 @@ void YCbCr_to_RGB(uint8_t* in, uint8_t* out)
     out[2] = clamp(round(Y + 1.772  * (Cb - 128)                      ));   // B
 }
 
-void output_to_pixel(context* ctx, int mcu_i, int data[3][32*32], uint8_t* pixel)
+void output_to_pixel(context* ctx, const vector<uint8_t>* data, uint8_t* pixel)
 {
     uint8_t in[3];
 
-    int hmcu_n = (ctx->width + ctx->mcu_w - 1) / ctx->mcu_w;    // number of MCUs in horizontal direction
-    int mcu_x = mcu_i % hmcu_n;
-    int mcu_y = mcu_i / hmcu_n;
+    int line = ctx->width;
 
-    for (int y = 0; y < ctx->mcu_h; y++) {
+    for (int y = 0; y < ctx->img_height; y++) {
 
-        uint8_t* out = pixel + ((mcu_y * ctx->mcu_h + y) * ctx->width + mcu_x * ctx->mcu_w) * ctx->comp_n;
+        uint8_t* out = pixel + (y * ctx->img_width) * ctx->comp_n;
 
-        if (mcu_y * ctx->mcu_h + y >= ctx->height) break;
-
-        for (int x = 0; x < ctx->mcu_w; x++) {
-
-            if (mcu_x * ctx->mcu_w + x >= ctx->width) break;
+        for (int x = 0; x < ctx->img_width; x++) {
 
             if (ctx->comp_n == 1) {
-                *out = data[0][ctx->mcu_w * y + x];
+                *out = data[0][y * line + x];
                 out += 1;
             } else {    // comp_n == 3
-                in[0] = data[0][ctx->mcu_w * y + x];
-                in[1] = data[1][ctx->mcu_w * y + x];
-                in[2] = data[2][ctx->mcu_w * y + x];
+                in[0] = data[0][y * line + x];
+                in[1] = data[1][y * line + x];
+                in[2] = data[2][y * line + x];
 
                 YCbCr_to_RGB(in, out);
                 out += 3;
@@ -614,33 +607,62 @@ void parse_jpeg(context* ctx)
     }
 }
 
+void reorder(context* ctx, int comp_i, int16_t* in, uint8_t* out)
+{
+    int H = ctx->comp[comp_i].h;
+    int V = ctx->comp[comp_i].v;
+    int h_mcus = ctx->width / ctx->mcu_w;
+    int v_mcus = ctx->height / ctx->mcu_h;
+    int h_blks = h_mcus * H;
+    int v_blks = v_mcus * V;
+    int line = 8 * h_blks;
+
+    for (int blk_y = 0; blk_y < v_blks; blk_y++) {
+        for (int blk_x = 0; blk_x < h_blks; blk_x++) {
+            int offset_out = blk_y * 8 * line + blk_x * 8;
+            int offset_in = ((blk_y * h_blks) + blk_x) * 64;
+            for (int y = 0; y < 8; y++) {
+                for (int x = 0; x < 8; x++) {
+                    out[offset_out + y * line + x] = in[offset_in + y * 8 + x];
+                }
+            }
+        }
+    }
+}
+
 uint8_t* convert_to_pixel_data(context* ctx)
 {
-    int data[3][32*32];
-    int buf[64];
+    assert(ctx->comp_n == 1 || ctx->comp_n == 3);
 
-    int size = ctx->width * ctx->height * ctx->comp_n;
+    vector<int16_t> buffer;
+    vector<uint8_t> data[3];
+    buffer.resize(ctx->mcu_w * ctx->mcu_h * ctx->mcu_n);
+    for (int i = 0; i < 3; i++)
+        data[i].resize(ctx->mcu_w * ctx->mcu_h * ctx->mcu_n);
+
+    int max_n = 0;
+    for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+        component_t& comp = ctx->comp[comp_i];
+        int16_t* p1 = comp.coeff;
+        int16_t* p2 = buffer.data();
+        int blk_n = ctx->mcu_n * comp.h * comp.v;
+        max_n = max(max_n, blk_n);
+        for (int i = 0; i < blk_n; i++) {
+            copy(p1, p1 + 64, p2);
+            dequantization(p2, ctx->q_table[comp.tq]);
+            inverseDCT(p2);
+            p1 += 64;
+            p2 += 64;
+        }
+        reorder(ctx, comp_i, buffer.data(), data[comp_i].data());
+        upsample(ctx, comp_i, data[comp_i].data());
+    }
+
+    int size = ctx->img_width * ctx->img_height * ctx->comp_n;
     uint8_t* pixels = new uint8_t[size];
 
-    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
-        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+    output_to_pixel(ctx, data, pixels);
 
-            int block_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
-            int16_t* p = ctx->comp[comp_i].coeff + mcu_i * 64 * block_n;
-
-            for (int blk_i = 0; blk_i < block_n; blk_i++) {
-
-                copy(p, p + 64, buf);
-                dequantization(buf, ctx->q_table[ctx->comp[comp_i].tq]);
-                inverseDCT(buf);
-
-                copy_to_mcu(ctx, comp_i, blk_i, buf, data[comp_i]);
-                p += 64;
-            }
-            upsample(ctx, comp_i, data[comp_i]);
-        }
-        output_to_pixel(ctx, mcu_i, data, pixels);
-    }
     return pixels;
 }
 
@@ -661,8 +683,8 @@ uint8_t* load_jpeg(const char* filename, int* width, int* height, int* channel)
     ctx.fp = fp;
 
     uint8_t* data = decode_jpeg(&ctx);
-    *width   = ctx.width;
-    *height  = ctx.height;
+    *width   = ctx.img_width;
+    *height  = ctx.img_height;
     *channel = ctx.comp_n;
 
     fclose(fp);
