@@ -104,6 +104,10 @@ struct scan_info {
         int td;
         int ta;
     } comp[3];
+    int ss;
+    int se;
+    int ah;
+    int al;
 };
 
 int get_pos(context* ctx)
@@ -291,6 +295,8 @@ void create_huffman_tree(context* ctx)
         L[i] = get_1byte(ctx);      // number of huffman codes of length i
 
     node*& root = (tc == 0) ? ctx->huffman_DC[th] : ctx->huffman_AC[th];
+    if (root)
+        destroy_huffman_tree(root);
     root = new node{NULL, NULL, 0};
 
     int code = 0;
@@ -465,20 +471,70 @@ void decode_entropy_sequential_non_interleaved(context* ctx, scan_info* info) {
     clearbit(ctx);
 }
 
-void decode_entropy_progressive_DC(context* ctx, int al)
+// interleaved
+void decode_entropy_progressive_DC(context* ctx, scan_info* info)
 {
-    int data[64] = {};
-    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
-        for (int comp_i = 0; comp_i < ctx->comp_n; comp_i++) {
+    int h_mcus = ctx->width / ctx->mcu_w;
+    int v_mcus = ctx->height / ctx->mcu_h;
 
-            int blk_n = ctx->comp[comp_i].h * ctx->comp[comp_i].v;
-            int16_t* out = ctx->comp[comp_i].coeff + mcu_i * 64 * blk_n;
+    for (int mcu_y = 0; mcu_y < v_mcus; mcu_y++) {
+        for (int mcu_x = 0; mcu_x < h_mcus; mcu_x++) {
+            for (int i = 0; i < info->n; i++) {
+                int comp_i = info->comp[i].id - 1;
+                int H = ctx->comp[comp_i].h;
+                int V = ctx->comp[comp_i].v;
+                int mcu_offset = (mcu_y * ((64 * H * V) * h_mcus)) + (mcu_x * (64 * H));
 
-            for (int blk_i = 0; blk_i < blk_n; blk_i++) {
-                load_huffman_DC(ctx, data, comp_i);
-                *out = data[0] << al;
-                out += 64;
+                for (int blk_y = 0; blk_y < V; blk_y++) {
+                    for (int blk_x = 0; blk_x < H; blk_x++) {
+                        int data[64] = {0};
+                        load_huffman_DC(ctx, data, comp_i);
+
+                        int blk_offset = (blk_y * (64 * h_mcus * H)) + (blk_x * 64);
+                        int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
+                        out[0] = data[0];
+                    }
+                }
             }
+        }
+    }
+    clearbit(ctx);
+}
+
+void decode_entropy_progressive_AC(context* ctx, scan_info* info)
+{
+    assert(info->n == 1);
+    int comp_i = info->comp[0].id - 1;
+    node* tree = ctx->huffman_AC[ctx->comp[comp_i].ta];
+
+    int blk_n = ctx->mcu_n * ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+
+    for (int blk_i = 0; blk_i < blk_n; blk_i++) {
+
+        int16_t* out = ctx->comp[comp_i].coeff + blk_i * 64;
+
+        int si = info->ss;
+        while (si <= info->se) {
+            int val = decode_huffman_tree(ctx, tree);
+            int run = val >> 4;
+            int size = val & 0xf;
+
+            if (size == 0) {
+                if (run <= 14) {        // EOB (End-Of-Band)
+                    int x = get_bits(ctx, run) + (1 << run);
+                    blk_i += x - 1;
+                    break;
+                }
+                if (run == 15) { si += 16; continue; }      // ZRL
+                ERROR("not come here");
+            }
+            si += run;
+
+            int x = get_bits(ctx, size);
+            x = extend(x, size);
+
+            out[ZZ[si]] = x;
+            si++;
         }
     }
     clearbit(ctx);
@@ -539,18 +595,19 @@ void parse_SOS(context* ctx) {
         info.comp[i] = {cid, td, ta};
         printf("  component id:%d, huff_table DC:%d, AC:%d\n", cid, td, ta);
     }
-    int ss = get_1byte(ctx);                // start of spectral selection
-    int se = get_1byte(ctx);                // end of spectral selection
-    int ah = get_bits(ctx, 4);              // successive approximation bit position high
-    int al = get_bits(ctx, 4);              // successive approximation bit position low (point transform): 0-13
-    printf("  spectral:%d-%d, ah:%d, al:%d\n", ss, se, ah, al);
+    info.ss = get_1byte(ctx);                // start of spectral selection
+    info.se = get_1byte(ctx);                // end of spectral selection
+    info.ah = get_bits(ctx, 4);              // successive approximation bit position high
+    info.al = get_bits(ctx, 4);              // successive approximation bit position low (point transform): 0-13
+    printf("  spectral:%d-%d, ah:%d, al:%d\n", info.ss, info.se, info.ah, info.al);
 
     bool is_interleaved = (ns != 1);
 
     if (ctx->is_progressive) {
-        if (ss == 0) {
-            decode_entropy_progressive_DC(ctx, al);
+        if (info.ss == 0) {
+            decode_entropy_progressive_DC(ctx, &info);
         } else {
+            decode_entropy_progressive_AC(ctx, &info);
         }
     } else {
         if (is_interleaved)
