@@ -419,29 +419,35 @@ void upsample(context *ctx, int comp_i, uint8_t* out) {
     }
 }
 
-void decode_entropy_sequential(context* ctx, scan_info* info)
+void decode_entropy_interleaved(context* ctx, scan_info* info)
 {
     int h_mcus = ctx->width / ctx->mcu_w;
-    int v_mcus = ctx->height / ctx->mcu_h;
 
-    for (int mcu_y = 0; mcu_y < v_mcus; mcu_y++) {
-        for (int mcu_x = 0; mcu_x < h_mcus; mcu_x++) {
-            for (int i = 0; i < info->n; i++) {
-                int comp_i = info->comp[i].id - 1;
-                int H = ctx->comp[comp_i].h;
-                int V = ctx->comp[comp_i].v;
-                int mcu_offset = (mcu_y * ((64 * H * V) * h_mcus)) + (mcu_x * (64 * H));
+    for (int mcu_i = 0; mcu_i < ctx->mcu_n; mcu_i++) {
+        int mcu_x = mcu_i % h_mcus;
+        int mcu_y = mcu_i / h_mcus;
 
-                for (int blk_y = 0; blk_y < V; blk_y++) {
-                    for (int blk_x = 0; blk_x < H; blk_x++) {
-                        int data[64] = {0};
-                        load_huffman_DC(ctx, data, comp_i);
-                        load_huffman_AC(ctx, data, comp_i);
+        for (int i = 0; i < info->n; i++) {
+            int comp_i = info->comp[i].id - 1;
+            int H = ctx->comp[comp_i].h;
+            int V = ctx->comp[comp_i].v;
+            int mcu_offset = (mcu_y * ((64 * H * V) * h_mcus)) + (mcu_x * (64 * H));
 
-                        int blk_offset = (blk_y * (64 * h_mcus * H)) + (blk_x * 64);
-                        int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
-                        copy(data, data + 64, out);
-                    }
+            for (int blk_i = 0; blk_i < H * V; blk_i++) {
+                int blk_x = blk_i % H;
+                int blk_y = blk_i / H;
+                int blk_offset = (blk_y * (64 * h_mcus * H)) + (blk_x * 64);
+                int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
+
+                if (ctx->is_progressive) {
+                    int data[64] = {0};
+                    load_huffman_DC(ctx, data, comp_i);
+                    out[0] = data[0];
+                } else {    // sequential
+                    int data[64] = {0};                     // default 0 for zero run-length
+                    load_huffman_DC(ctx, data, comp_i);
+                    load_huffman_AC(ctx, data, comp_i);
+                    copy(data, data + 64, out);
                 }
             }
         }
@@ -467,36 +473,6 @@ void decode_entropy_sequential_non_interleaved(context* ctx, scan_info* info) {
 
         copy(data, data + 64, out);
         out += 64;
-    }
-    clearbit(ctx);
-}
-
-// interleaved
-void decode_entropy_progressive_DC(context* ctx, scan_info* info)
-{
-    int h_mcus = ctx->width / ctx->mcu_w;
-    int v_mcus = ctx->height / ctx->mcu_h;
-
-    for (int mcu_y = 0; mcu_y < v_mcus; mcu_y++) {
-        for (int mcu_x = 0; mcu_x < h_mcus; mcu_x++) {
-            for (int i = 0; i < info->n; i++) {
-                int comp_i = info->comp[i].id - 1;
-                int H = ctx->comp[comp_i].h;
-                int V = ctx->comp[comp_i].v;
-                int mcu_offset = (mcu_y * ((64 * H * V) * h_mcus)) + (mcu_x * (64 * H));
-
-                for (int blk_y = 0; blk_y < V; blk_y++) {
-                    for (int blk_x = 0; blk_x < H; blk_x++) {
-                        int data[64] = {0};
-                        load_huffman_DC(ctx, data, comp_i);
-
-                        int blk_offset = (blk_y * (64 * h_mcus * H)) + (blk_x * 64);
-                        int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
-                        out[0] = data[0];
-                    }
-                }
-            }
-        }
     }
     clearbit(ctx);
 }
@@ -605,13 +581,13 @@ void parse_SOS(context* ctx) {
 
     if (ctx->is_progressive) {
         if (info.ss == 0) {
-            decode_entropy_progressive_DC(ctx, &info);
+            decode_entropy_interleaved(ctx, &info);
         } else {
             decode_entropy_progressive_AC(ctx, &info);
         }
     } else {
         if (is_interleaved)
-            decode_entropy_sequential(ctx, &info);
+            decode_entropy_interleaved(ctx, &info);
         else
             decode_entropy_sequential_non_interleaved(ctx, &info);
     }
