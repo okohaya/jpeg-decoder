@@ -440,9 +440,13 @@ void decode_entropy_interleaved(context* ctx, scan_info* info)
                 int16_t* out = ctx->comp[comp_i].coeff + mcu_offset + blk_offset;
 
                 if (ctx->is_progressive) {
-                    int data[64] = {0};
-                    load_huffman_DC(ctx, data, comp_i);
-                    out[0] = data[0];
+                    if (info->ah == 0) {                        // first scan
+                        int data[64] = {0};
+                        load_huffman_DC(ctx, data, comp_i);
+                        out[0] = data[0] * (1 << info->al);
+                    } else {                                    // refinment scan
+                        out[0] |= get_bits(ctx, 1) << info->al;
+                    }
                 } else {    // sequential
                     int data[64] = {0};                     // default 0 for zero run-length
                     load_huffman_DC(ctx, data, comp_i);
@@ -509,8 +513,75 @@ void decode_entropy_progressive_AC(context* ctx, scan_info* info)
             int x = get_bits(ctx, size);
             x = extend(x, size);
 
-            out[ZZ[si]] = x;
+            out[ZZ[si]] = x * (1 << info->al);
             si++;
+        }
+    }
+    clearbit(ctx);
+}
+
+void decode_entropy_progressive_AC_refine(context* ctx, scan_info* info)
+{
+    assert(info->n == 1);
+    int comp_i = info->comp[0].id - 1;
+    node* tree = ctx->huffman_AC[ctx->comp[comp_i].ta];
+
+    int blk_n = ctx->mcu_n * ctx->comp[comp_i].h * ctx->comp[comp_i].v;
+    int eob = 0;            // End-Of-Band
+
+    for (int blk_i = 0; blk_i < blk_n; blk_i++) {
+
+        int16_t* out = ctx->comp[comp_i].coeff + blk_i * 64;
+
+        if (eob) {
+            for (int si = info->ss; si <= info->se; si++) {
+                if (out[ZZ[si]] && get_bits(ctx, 1))
+                    out[ZZ[si]] += (out[ZZ[si]] > 0 ? 1 : -1) * (1 << info->al);    // correction
+            }
+            eob--;
+            continue;
+        }
+
+        int si = info->ss;
+        while (si <= info->se) {
+
+            int tmp = decode_huffman_tree(ctx, tree);
+            int run = tmp >> 4;
+            int size = tmp & 0xf;
+            int new_coeff = 1 << info->al;
+
+            if (size == 0) {
+                if (run == 15) {    // ZRL
+                    new_coeff = 0;
+                } else {            // End-Of-Band
+                    eob = get_bits(ctx, run) + (1 << run);
+                    // skip all zero coefficients on current block
+                    run = 63;
+                    eob--;
+                }
+            } else {
+                if (size != 1) ERROR("size %d invalid", size);
+
+                if (get_bits(ctx, 1) == 0) {    // sign 0:negative 1:positive
+                    new_coeff *= -1;
+                }
+            }
+
+            while (si <= info->se) {
+                if (out[ZZ[si]] == 0) {
+                    if (run == 0) {             // newly non-zero coefficient or ZRL
+                        out[ZZ[si++]] = new_coeff;
+                        break;
+                    } else {                    // zero coefficient
+                        run--;
+                    }
+                } else {
+                    if (get_bits(ctx, 1)) {     // correction
+                        out[ZZ[si]] += (out[ZZ[si]] > 0 ? 1 : -1) * (1 << info->al);
+                    }
+                }
+                si++;
+            }
         }
     }
     clearbit(ctx);
@@ -583,7 +654,10 @@ void parse_SOS(context* ctx) {
         if (info.ss == 0) {
             decode_entropy_interleaved(ctx, &info);
         } else {
-            decode_entropy_progressive_AC(ctx, &info);
+            if (info.ah == 0)
+                decode_entropy_progressive_AC(ctx, &info);
+            else
+                decode_entropy_progressive_AC_refine(ctx, &info);
         }
     } else {
         if (is_interleaved)
@@ -599,7 +673,6 @@ void parse_jpeg(context* ctx)
     if (signature != 0xffd8) {
         ERROR("not jpeg file");
     }
-    int debug_scan = 0;
     while (1) {
         int marker = get_marker(ctx);
         switch (marker) {
@@ -623,7 +696,6 @@ void parse_jpeg(context* ctx)
                 break;
             case 0xda:
                 parse_SOS(ctx);
-                //if (++debug_scan == 1) { printf("debug\n"); return; }
                 break;
             case 0xd9:
                 printf("[EOI]\n");
